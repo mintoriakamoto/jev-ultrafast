@@ -1,6 +1,7 @@
 """The complete agent loop. Typed choices, observable state, bounded execution."""
 
 import base64
+import hashlib
 import time
 from pathlib import Path
 
@@ -10,7 +11,7 @@ from .questions import MAX_STEPS
 
 
 class Agent:
-    def __init__(self, url, goals, *, record_dir=None, screenshots=False):
+    def __init__(self, url, goals, *, record_dir=None, screenshots=False, memo_cache_size=1000):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
             raise ValueError("Supply a task")
@@ -19,6 +20,9 @@ class Agent:
         self.browser = Browser(url)
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)
+        self.memo_cache = {}
+        self.memo_max_size = memo_cache_size
+        self.goal_hash = hashlib.sha256(task.encode()).hexdigest()[:16]
         try:
             page = self.browser.observe(screenshot=self.screenshots)
         except Exception:
@@ -38,6 +42,7 @@ class Agent:
             elapsed_ms=0,
             started_at=None,
             record=bool(self.record_dir),
+            memo_hits=0,
         )
         if self.record_dir:
             self.record_dir.mkdir(parents=True, exist_ok=True)
@@ -74,12 +79,29 @@ class Agent:
                 raise ValueError("This run has stopped. Start a fresh demo.")
             if len(state["decisions"]) >= MAX_STEPS * 2:
                 raise ValueError("Reached the demo's model-call budget")
-            state["decision"] = choose(state["page"], state["goal"], state["history"])
+
+            # Check memo cache: (fingerprint, goal_hash) -> decision
+            fingerprint = state["page"]["fingerprint"]
+            cache_key = (fingerprint, self.goal_hash)
+            from_memo = False
+            if cache_key in self.memo_cache:
+                state["decision"] = self.memo_cache[cache_key].copy()
+                state["memo_hits"] += 1
+                from_memo = True
+            else:
+                # Call TypeSafe
+                state["decision"] = choose(state["page"], state["goal"], state["history"])
+                # Cache it (with bounded size; evict if over limit)
+                if len(self.memo_cache) >= self.memo_max_size:
+                    self.memo_cache.pop(next(iter(self.memo_cache)))
+                self.memo_cache[cache_key] = state["decision"].copy()
+
             state["decisions"].append(
                 {
                     **state["decision"],
                     "fingerprint": state["page"]["fingerprint"],
                     "elapsed_ms": round((time.perf_counter() - state["started_at"]) * 1000),
+                    "from_memo": from_memo,
                 }
             )
             state["status"] = "predicted"
